@@ -14,6 +14,10 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 
+
+import ultrafastFitFunctions as ufff
+import lmfit as lm
+
 class DaskSetup:
     def da_imsave(fnames, arr, compute=False):
         """Write arr to a stack of images assuming
@@ -356,7 +360,49 @@ class DataEvaluation:
         array_I_pumped_norm = np.array(list_I_pumped_norm)
 
 
-        I_unpumped_mean = array_I_unpumped.mean(axis=1)
-        I_pumped_mean = array_I_pumped.mean(axis=1)
+        I_unpumped_mean = array_I_unpumped.mean(axis=1)    # maybe sum would be better???
+        I_pumped_mean = array_I_pumped.mean(axis=1)    # maybe sum would be better???
 
         return I_unpumped_mean, I_pumped_mean
+
+    
+    
+    def check_overlap(self, start, stop, xi, xf, scan_type = 'mhor', vary = True):
+    
+    
+        nums = np.arange(start, stop+1)
+        
+        unpumped, pumped = self.integrated_series(nums)
+        
+        scan = unpumped/pumped
+
+        x = np.linspace(xi, xf, stop-start+1)
+
+        mod = lm.Model(ufff.peaks.gauss.normGauss)
+        pars = lm.Parameters()
+
+
+        vary = vary
+        pars.add('mu',  value = (xi+xf)/2.0,   vary = vary)
+        pars.add('sig', value = (xf-xi)/9.0,  vary = False)
+        pars.add('A',   value = 0.6      ,   vary = False)
+        pars.add('c',   value = 1.0        ,   vary = False)
+
+        out = mod.fit(scan, pars, x = x)
+
+        plt.figure()
+        plt.subplot(1,2,1)
+        plt.plot(x, unpumped, label = 'unpumped')
+        plt.plot(x, pumped, label = 'unpumped')
+        plt.xlabel(scan_type)
+        plt.ylabel('q-average intensity')
+
+        plt.subplot(1,2,2)
+        plt.plot(x, scan, 'o', label = '-unpumped/pumped', alpha = 0.5)
+        plt.plot(x, out.best_fit, '-', label = 'fit')
+        plt.xlabel(scan_type)
+        plt.ylabel('q-average intensity')
+        plt.tight_layout()
+        plt.show()
+
+        return scan, out, unpumped, pumped

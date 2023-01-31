@@ -9,8 +9,97 @@ import dask
 import dask.array as da
 from dask.distributed import Client
 
+from tqdm.auto import tqdm
+
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+
+class DaskSetup:
+    def da_imsave(fnames, arr, compute=False):
+        """Write arr to a stack of images assuming
+        the last two dimensions of arr as image dimensions.
+
+        Parameters
+        ----------
+        fnames: string
+            A formatting string like 'myfile{:02d}.png'
+            Should support arr.ndims-2 indices to be formatted
+        arr: dask.array
+            Array of at least 2 dimensions to be written to disk as images
+        compute: Boolean (optional)
+            whether to write to disk immediately or return a dask.array of the to be written indices
+
+        """
+        indices = [da.arange(n, chunks=c) for n,c in zip(arr.shape[:-2], arr.chunksize[:-2])]
+        index_array = da.stack(da.meshgrid(*indices,indexing='ij'), axis=-1).rechunk({-1:-1})
+
+        @da.as_gufunc(signature=f"(i,j),({arr.ndim-2})->({arr.ndim-2})", output_dtypes=int, vectorize=True)
+        def saveimg(image, index):
+            im = Image.fromarray(image.squeeze().astype(np.uint32))
+            im.save(fnames.format(*index))
+            return index
+
+        res = saveimg(arr,index_array)
+        if compute == True:
+            res.compute()
+        else:
+            return res     
+        
+        @da.as_gufunc(signature=f"(i,j),(),()->(i,j)", output_dtypes=int, vectorize=True)
+        def max_of_clusters_var_cl_th_counts(img, cl, th):
+            mask = np.ones([cl,cl])
+            clusters_scipy = convolve2d(img, mask, mode='same', fillvalue=0)
+            maxima = peak_local_max(clusters_scipy, min_distance=cl, threshold_abs=th)
+            max_value_mask = np.zeros([400,400])
+            max_value_mask[maxima[:,0], maxima[:,1]] = 1
+            max_clusts = clusters_scipy * max_value_mask
+            counts = max_value_mask.sum(axis=(0,1))
+            return max_clusts
+        
+        @da.as_gufunc(signature=f"(i,j),(),(),()->(i,j)", output_dtypes=int, vectorize=True, allow_rechunk=True)
+        def single_photon_mask_var_cl_th_dis(img, cl, th, dis): # dis must be at least 1 
+            mask = np.ones([cl,cl])
+            clusters_scipy = convolve2d(img, mask, mode='same', fillvalue=0)
+            maxima = peak_local_max(clusters_scipy, min_distance=dis, threshold_abs=th)
+            mask = np.zeros([400,400])
+            mask[tuple(maxima.T)] = True
+            return mask
+        
+        @da.as_gufunc(signature=f"(i,j),()->(i,j)", output_dtypes=int, vectorize=True, allow_rechunk=True)
+        def single_photon_mask_ver(img, th):
+            mask_ver = np.ones([2,1])
+            clusters_scipy_ver = convolve2d(img, mask_ver, mode='same', fillvalue=0)
+            maxima_ver = peak_local_max(clusters_scipy_ver, min_distance=1, threshold_abs=th)
+            mask = np.zeros([400,400])
+            mask[tuple(maxima_ver.T)] = True
+            return mask
+        
+        @da.as_gufunc(signature=f"(i,j),()->(i,j)", output_dtypes=int, vectorize=True, allow_rechunk=True)
+        def single_photon_mask_hor(img, th):
+            mask_hor = np.ones([1,2])
+            clusters_scipy_hor = convolve2d(img, mask_hor, mode='same', fillvalue=0)
+            maxima_hor = peak_local_max(clusters_scipy_hor, min_distance=1, threshold_abs=th)
+            mask = np.zeros([400,400])
+            mask[tuple(maxima_hor.T)] = True
+            return mask
+        
+        
+        @da.as_gufunc(signature=f"(i,j),()->(i,j)", output_dtypes=int, vectorize=True, allow_rechunk=True)
+        def single_photon_mask_ver_hor(img, th):
+            img_pos = (img > 0) * img
+            mask_ver = np.ones([2,1])
+            mask_hor = np.ones([1,2])
+            clusters_scipy_ver = convolve2d(img_pos, mask_ver, mode='same', fillvalue=0)
+            clusters_scipy_hor = convolve2d(img_pos, mask_hor, mode='same', fillvalue=0)
+            maxima_ver = peak_local_max(clusters_scipy_ver, min_distance=1, threshold_abs=th)
+            maxima_hor = peak_local_max(clusters_scipy_hor, min_distance=1, threshold_abs=th)
+            mask_ver = np.zeros([400,400])
+            mask_ver[tuple(maxima_ver.T)] = True
+            mask_hor = np.zeros([400,400])
+            mask_ver[tuple(maxima_hor.T)] = True
+            mask = np.logical_or(mask_ver, mask_hor)
+            return mask
+
 
 class DataEvaluation:
     def __init__(self,
@@ -21,6 +110,8 @@ class DataEvaluation:
                  dist=0.620,
                  wavelength = 1.8e-9,
                  npt = 40,
+                 qi  = 7,
+                 qf  = 22,
                  center=(185,210),
                  storage_path = "/mnt/temp_nvme_ssd",
                  invert = False):
@@ -38,6 +129,9 @@ class DataEvaluation:
                                      wavelength=wavelength) # wavelength of x-ray beam
         
         self.npt = npt
+        
+        self.qi = qi
+        self.qf = qf
         
         
         self.day = day
@@ -93,8 +187,8 @@ class DataEvaluation:
          
 
         path_base       = r'%s/%s/'%(self.path,num)
-        path_pumped     = path_base + r'*[0,2,4,6,8].tiff' # example path
-        path_unpumped   = path_base + r'*[1,3,5,7,9].tiff' # example path
+        path_unpumped     = path_base + r'*[0,2,4,6,8].tiff' # example path
+        path_pumped   = path_base + r'*[1,3,5,7,9].tiff' # example path
 
         if verbose:
             print(self.path)
@@ -126,31 +220,53 @@ class DataEvaluation:
             if t is not None:
 
                 # boolean masks
-                mask_pumped = (pumped > t[0]) & (pumped < t[1])
+                
                 mask_unpumped = (unpumped > t[0]) & (unpumped < t[1])
+                mask_pumped = (pumped > t[0]) & (pumped < t[1])
 
                 #apply masks
-                pumped   = pumped * mask_pumped
                 unpumped = unpumped * mask_unpumped
+                pumped   = pumped * mask_pumped
 
-            #sum, and compute
-            pumped   = pumped.mean(axis=0).compute()
+            #mean and compute
             unpumped = unpumped.mean(axis=0).compute()
+            pumped   = pumped.mean(axis=0).compute()
 
         if mode == 'counting':
             
             raise ValueError('Not implemented yet!')
             
             if t is not None:
-                counting_pumped = single_photon_mask_ver_hor(pumped, t[0])
                 counting_unpumped = single_photon_mask_ver_hor(unpumped, t[0])
-                pumped   = counting_pumped.mean(axis=0).compute()
+                counting_pumped = single_photon_mask_ver_hor(pumped, t[0])
                 unpumped = counting_unpumped.mean(axis=0).compute()
+                pumped   = counting_pumped.mean(axis=0).compute()
 
 
         return unpumped, pumped
+
+    def check_image(self, num):
+        
+        # todo: change axis to mm via self.px_size or to q...
+        
+        unpumped, pumped = self.get_images(num)
+        plt.figure()
+        for i, image in enumerate([unpumped, pumped]):
+
+            plt.subplot(1,2,i+1)
+            plt.imshow(image, norm=self.log_norm, interpolation="none")
+            plt.imshow(self.mask, alpha=0.5)
+            plt.plot(self.center[0], self.center[1], ".", markersize=10, color = 'r', alpha = 0.3)
+            plt.axvline(self.center[0], color = 'r', alpha = 0.3)
+            plt.axhline(self.center[1], color = 'r', alpha = 0.3)
+            plt.title('%s'%['Unpumped','Pumped'][i])
+            plt.xlabel('x-coordinate / px')
+            plt.ylabel('y-coordinate / px')
+            plt.tight_layout()
+        plt.show()
     
-    def ai_single(self, num, qi = 10, qf = 20):
+    
+    def ai_single(self, num):
         """ Azimuthal Integrator for single SAXS images
         
         Gets pumped and unpumped images with get_images funtion
@@ -166,52 +282,38 @@ class DataEvaluation:
         
         Returns
             q               : 1-d array; q vectors
-            I_pumped        : 1-d array; un-normalised intensities for pumped images 
+            
             I_unpumped      : 1-d array; un-normalised intensities for unpumped images 
-            norm_pumped     : 1-d array; intensities normalised to direct beam (inner mask part) for pumped images 
+            I_pumped        : 1-d array; un-normalised intensities for pumped images 
+            
             norm_unpumped   : 1-d array; intensities normalised to direct beam (inner mask part) for unpumped images 
+            norm_pumped     : 1-d array; intensities normalised to direct beam (inner mask part) for pumped images 
         
         """
         unpumped, pumped = self.get_images(num)
-        q, I_pump = self.ai.integrate1d(pumped, npt = self.npt, mask=self.mask)
-        q, I_unpump = self.ai.integrate1d(unpumped, npt = self.npt, mask=self.mask)
+        q, I_unpumped = self.ai.integrate1d(unpumped, npt = self.npt, mask=self.mask)
+        q, I_pumped = self.ai.integrate1d(pumped, npt = self.npt, mask=self.mask)
 
         # searching for q indexes where q is less than q1 [um^-1] and greater than q2 [um^-1]
         # thus q1 and q2 are divided by 1000, pyfai output is in nm^-1...
-        indexes_q = np.argwhere(np.logical_and(q >= qi/1000, q <= qf/1000))
+        indexes_q = np.argwhere(np.logical_and(q >= self.qi/1000, q <= self.qf/1000))
 
         q = q[indexes_q]
-        I_pumped = I_pump[indexes_q]
-        I_unpumped = I_unpump[indexes_q]
+        I_unpumped = I_unpumped[indexes_q]
+        I_pumped = I_pumped[indexes_q]
+        
 
-        I_pumped_norm = (pumped * self.mask).sum()      # change to inner part only!!!!!
+        
         I_unpumped_norm = (unpumped * self.mask).sum()      # change to inner part only!!!!!
+        I_pumped_norm = (pumped * self.mask).sum()      # change to inner part only!!!!!
         
-        return q, I_pumped, I_unpumped, I_pumped_norm, I_unpumped_norm
+        return q, I_unpumped, I_pumped, I_unpumped_norm, I_pumped_norm
     
-    def check_image(self, num):
-        
-        # todo: change axis to mm via self.px_size or to q...
-        
-        unpumped, pumped = self.get_images(num)
-        plt.figure()
-        for i, image in enumerate([pumped, unpumped]):
 
-            plt.subplot(1,2,i+1)
-            plt.imshow(image, norm=self.log_norm, interpolation="none")
-            plt.imshow(self.mask, alpha=0.5)
-            plt.plot(self.center[0], self.center[1], ".", markersize=10, color = 'r', alpha = 0.3)
-            plt.axvline(self.center[0], color = 'r', alpha = 0.3)
-            plt.axhline(self.center[1], color = 'r', alpha = 0.3)
-            plt.title('%s'%['Unpumped','Pumped'][i])
-            plt.xlabel('x-coordinate / px')
-            plt.ylabel('y-coordinate / px')
-            plt.tight_layout()
-        plt.show()
         
     def check_q_integration(self, num, norm = False):
         
-        q, I_pumped, I_unpumped, I_pumped_norm, I_unpumped_norm = self.ai_single(num)
+        q, I_unpumped, I_pumped, I_unpumped_norm, I_pumped_norm = self.ai_single(num)
         
         
         if norm:
@@ -227,39 +329,34 @@ class DataEvaluation:
         plt.xlabel('scattering vector / (1/nm)')
         plt.ylabel('Intensity')                   
         plt.legend()
-        
     
 
-    
-    def integrated_series(self, numbers, d = None, m = None, y = None, t = (100, 200), q0 = 10, q1 = 20):
-        """ Takes numbers of scans and returns 
+    def integrated_series(self, nums):
         """
-        if y is None:
-            y  = self.year
-        if m is None:
-            m = self.month
-        if d is None:
-            d = self.day
+        Takes numbers of scans and returns the integrated q-vectors for unpumped and pumped AIs
+        
+        returns:  1-d array
+        """
     
-        list_ai_pump = []
-        list_ai_unpump = []
-        list_norm_pump = []
-        list_norm_unpump = []
+        list_I_unpumped = []
+        list_I_pumped = []
+        list_I_unpumped_norm = []
+        list_I_pumped_norm = []
 
-        for num in tqdm(numbers):
-            q, ip, iup, norm_p, norm_up = ai_single(num, mask, d=d, q0=q0, q1=q1)
-            list_ai_pump.append(np.copy(ip))
-            list_ai_unpump.append(np.copy(iup))
-            list_norm_pump.append(np.copy(norm_p))
-            list_norm_unpump.append(np.copy(norm_up))
+        for num in tqdm(nums):
+            q, I_unpumped, I_pumped, I_unpumped_norm, I_pumped_norm = self.ai_single(num)
+            list_I_unpumped.append(np.copy(I_unpumped))
+            list_I_pumped.append(np.copy(I_pumped))
+            list_I_unpumped_norm.append(np.copy(I_unpumped_norm))
+            list_I_pumped_norm.append(np.copy(I_pumped_norm))
 
-        ai_pump = np.array(list_ai_pump)
-        ai_unpump = np.array(list_ai_unpump)
-        norm_pump = np.array(list_norm_pump)
-        norm_unpump = np.array(list_norm_unpump)
+        array_I_unpumped = np.array(list_I_unpumped)
+        array_I_pumped = np.array(list_I_pumped)
+        array_I_unpumped_norm = np.array(list_I_unpumped_norm)
+        array_I_pumped_norm = np.array(list_I_pumped_norm)
 
 
-        peak_pump = ai_pump.mean(axis=1)
-        peak_unpump = ai_unpump.mean(axis=1)
+        I_unpumped_mean = array_I_unpumped.mean(axis=1)
+        I_pumped_mean = array_I_pumped.mean(axis=1)
 
-        return peak_pump, peak_unpump
+        return I_unpumped_mean, I_pumped_mean
